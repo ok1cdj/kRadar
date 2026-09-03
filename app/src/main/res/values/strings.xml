@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">kRadar</string>
+
+    <!-- Status / states -->
+    <string name="loading">Loading radar…</string>
+    <string name="locating">Getting location…</string>
+    <string name="need_location">Location permission is required to center the radar.</string>
+    <string name="grant_permission">Grant permission</string>
+    <string name="no_location">No location fix available.</string>
+    <string name="error_generic">Error: %1$s</string>
+    <string name="now">now</string>
+
+    <!-- Controls -->
+    <string name="play">Play</string>
+    <string name="pause">Pause</string>
+    <string name="step_back">Previous frame</string>
+    <string name="step_fwd">Next frame</string>
+    <string name="zoom_in">+</string>
+    <string name="zoom_out">−</string>
+
+    <!-- Mandatory RainViewer attribution -->
+    <string name="attribution">Weather data by RainViewer — rainviewer.com</string>
+    <string name="updated">Updated %1$s</string>
+
+    <!-- About dialog -->
+    <string name="about">About</string>
+    <string name="about_title">kRadar</string>
+    <string name="about_version">Version %1$s</string>
+    <string name="about_author">by Ondřej Koloničný, OK1CDJ</string>
+    <string name="about_desc">Precipitation radar for the Mudita Kompakt. Overlays RainViewer radar on a vector map centered on your location.</string>
+    <string name="about_license">License: GPL-3.0</string>
+    <string name="about_credits">Weather data by RainViewer. Country borders © Natural Earth (public domain). Cities © GeoNames (CC BY 4.0).</string>
+    <string name="about_coffee">Buy me a coffee</string>
+    <string name="about_github">GitHub</string>
+    <string name="close">Close</string>
+</resources>

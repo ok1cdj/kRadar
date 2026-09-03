@@ -1,0 +1,18 @@
+# Secrets & signing — NEVER commit
+local.properties
+keystore/
+*.jks
+*.keystore
+
+# Build output
+.gradle/
+build/
+app/build/
+captures/
+kradar-*.apk
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+.DS_Store
+*.log

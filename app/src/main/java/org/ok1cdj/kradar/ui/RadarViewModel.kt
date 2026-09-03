@@ -1,0 +1,205 @@
+package org.ok1cdj.kradar.ui
+
+import android.app.Application
+import android.graphics.Bitmap
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.ok1cdj.kradar.location.LatLon
+import org.ok1cdj.kradar.location.LocationProvider
+import org.ok1cdj.kradar.net.RainViewerClient
+import org.ok1cdj.kradar.render.EinkConverter
+
+/**
+ * Owns the radar state machine: location, zoom, prefetch of all frames, and
+ * animation playback. All tiles are downloaded + quantized up front in
+ * [refresh]; playback only swaps in-memory bitmaps (no network at play time).
+ */
+class RadarViewModel(app: Application, private val saved: SavedStateHandle) : AndroidViewModel(app) {
+
+    // Zoom (and last location) persist across config change AND process death, so
+    // a restart returns to the same view instead of resetting to the default.
+    private val _state = MutableStateFlow(
+        RadarUiState(
+            zoom = saved.get<Int>(KEY_ZOOM) ?: RadarUiState.DEFAULT_ZOOM,
+            location = savedLocation(),
+        )
+    )
+    val state = _state.asStateFlow()
+
+    private var refreshJob: Job? = null
+    private var playJob: Job? = null
+
+    /** Playback tick interval — tune on device. */
+    private val playbackIntervalMs = 550L
+
+    /** Read last-known GPS/network location and (re)load the radar. */
+    fun locate() {
+        val ctx = getApplication<Application>()
+        if (!LocationProvider.hasPermission(ctx)) {
+            _state.update { it.copy(permissionDenied = true) }
+            return
+        }
+        val loc = LocationProvider.lastKnown(ctx) ?: savedLocation()
+        if (loc == null) {
+            // Permission granted but no cached fix yet.
+            _state.update {
+                if (it.location == null) it.copy(permissionDenied = false, error = NO_FIX) else it
+            }
+            return
+        }
+        saved[KEY_LAT] = loc.lat
+        saved[KEY_LON] = loc.lon
+        _state.update { it.copy(location = loc, permissionDenied = false, error = null) }
+        refresh()
+    }
+
+    private fun savedLocation(): LatLon? {
+        val lat = saved.get<Double>(KEY_LAT) ?: return null
+        val lon = saved.get<Double>(KEY_LON) ?: return null
+        return LatLon(lat, lon)
+    }
+
+    /** Called after the runtime permission dialog resolves. */
+    fun onPermissionResult(granted: Boolean) {
+        if (granted) locate() else _state.update { it.copy(permissionDenied = true) }
+    }
+
+    fun zoomIn() = changeZoom(+1)
+    fun zoomOut() = changeZoom(-1)
+
+    private fun changeZoom(delta: Int) {
+        val cur = _state.value
+        val z = (cur.zoom + delta).coerceIn(RadarUiState.MIN_ZOOM, RadarUiState.MAX_ZOOM)
+        if (z == cur.zoom || cur.location == null) return
+        saved[KEY_ZOOM] = z
+        _state.update { it.copy(zoom = z) }
+        refresh()
+    }
+
+    /**
+     * Fetch metadata, download + quantize every frame at the current
+     * location/zoom, then swap them in. Cancels any in-flight refresh.
+     */
+    fun refresh() {
+        val loc = _state.value.location ?: return
+        pause()
+        refreshJob?.cancel()
+        refreshJob = viewModelScope.launch {
+            _state.update { it.copy(loading = true, error = null) }
+            try {
+                val zoom = _state.value.zoom
+                val size = _state.value.tileSize
+                val (bitmaps, times, nowcast) = withContext(Dispatchers.IO) {
+                    downloadFrames(loc, zoom, size)
+                }
+                if (bitmaps.isEmpty()) {
+                    _state.update { it.copy(loading = false, error = NO_DATA) }
+                    return@launch
+                }
+                val old = _state.value.frames
+                _state.update {
+                    it.copy(
+                        frames = bitmaps,
+                        frameTimes = times,
+                        frameNowcast = nowcast,
+                        framesZoom = zoom,       // tag so the overlay only shows when aligned
+                        framesCenter = loc,
+                        currentIndex = bitmaps.lastIndex, // start on the latest ("now")
+                        loading = false,
+                        error = null,
+                    )
+                }
+                old.forEach { if (!it.isRecycled) it.recycle() }
+            } catch (_: kotlinx.coroutines.CancellationException) {
+                throw kotlinx.coroutines.CancellationException()
+            } catch (e: Exception) {
+                _state.update { it.copy(loading = false, error = e.message ?: "network error") }
+            }
+        }
+    }
+
+    private suspend fun downloadFrames(
+        loc: LatLon,
+        zoom: Int,
+        size: Int,
+    ): Triple<List<Bitmap>, List<Long>, List<Boolean>> = withContext(Dispatchers.IO) {
+        val frames = RainViewerClient.fetchFrames()
+        // Fetch + quantize all tiles concurrently; keep frame order.
+        val deferred: List<Deferred<Pair<Bitmap, org.ok1cdj.kradar.net.RadarFrame>?>> =
+            frames.map { f ->
+                async {
+                    try {
+                        val png = RainViewerClient.fetchTile(f, loc.lat, loc.lon, zoom, size)
+                        EinkConverter.toEink(png)?.let { it to f }
+                    } catch (_: Exception) {
+                        null // skip a bad frame rather than failing the whole set
+                    }
+                }
+            }
+        val ok = deferred.awaitAll().filterNotNull()
+        Triple(ok.map { it.first }, ok.map { it.second.timeSec }, ok.map { it.second.nowcast })
+    }
+
+    // --- playback ---------------------------------------------------------
+
+    fun togglePlay() = if (_state.value.isPlaying) pause() else play()
+
+    fun play() {
+        if (!_state.value.hasFrames || _state.value.isPlaying) return
+        _state.update { it.copy(isPlaying = true) }
+        playJob = viewModelScope.launch {
+            while (true) {
+                delay(playbackIntervalMs)
+                _state.update {
+                    if (!it.hasFrames) it
+                    else it.copy(currentIndex = (it.currentIndex + 1) % it.frames.size)
+                }
+            }
+        }
+    }
+
+    fun pause() {
+        playJob?.cancel()
+        playJob = null
+        if (_state.value.isPlaying) _state.update { it.copy(isPlaying = false) }
+    }
+
+    fun stepForward() = step(+1)
+    fun stepBack() = step(-1)
+
+    private fun step(delta: Int) {
+        pause()
+        _state.update {
+            if (!it.hasFrames) it
+            else {
+                val n = it.frames.size
+                it.copy(currentIndex = ((it.currentIndex + delta) % n + n) % n)
+            }
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        _state.value.frames.forEach { if (!it.isRecycled) it.recycle() }
+    }
+
+    companion object {
+        private const val NO_DATA = "No radar data available."
+        private const val NO_FIX = "No location fix yet — try again in a moment."
+        private const val KEY_ZOOM = "zoom"
+        private const val KEY_LAT = "lat"
+        private const val KEY_LON = "lon"
+    }
+}
